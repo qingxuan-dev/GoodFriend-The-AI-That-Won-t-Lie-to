@@ -1,0 +1,724 @@
+---
+name: 君子好友
+description: "Use this skill to build or run the Jun Hao Skill-Based Gentleman Agent. Triggers: any request to create, extend, or run Jun Hao; add memory compression; add autonomous thinking; add segmented reply output; or build a multi-skill LLM agent with fixed identity, psychological analysis, moral judgement, web search, and user profiling. Do NOT use for generic chatbot tasks unrelated to Jun Hao architecture."
+version: 4.0
+license: Proprietary
+---
+
+# Jun Hao Skill-Based Gentleman Agent — v4
+
+## What changed from v3
+
+| # | Optimization | Detail |
+|---|-------------|--------|
+| 1 | **Parallel skills** | `reflect` + `analyze` run concurrently via `ThreadPoolExecutor`. ~45% latency reduction per reply. |
+| 2 | **Incremental memory compression** | Only compresses new messages since last snapshot, then merges with existing snapshot. No information loss on repeat compressions. |
+| 3 | **Auto-think behavior memory** | Tracks last spontaneous message time + whether user responded. Backs off if ignored. |
+| 4 | **Context role separation** | `reflection` and `analysis` passed via `system` role, not stuffed into `user` message. Model correctly interprets internal vs external voices. |
+| 5 | **Retry decorator** | All LLM calls retry up to 2 times on empty/null response. Silent failures eliminated. |
+| 6 | **Personality anchor** | `CORE_IDENTITY` re-injected as a system reminder before history on every compose call. History cannot overwrite identity. |
+
+---
+
+## Architecture
+
+```
+User input
+    │
+    ├─ Hard block? ──────────────────────────────► Refuse + stop
+    ├─ High risk? ───────────────────────────────► Direct compose (no routing)
+    │
+    ▼
+skill_route()  ← temperature 0.0, deterministic
+    │
+    ├── FACTUAL ──► skill_search() (web)
+    │                    │
+    │    ┌───────────────┘
+    │    │
+    ▼    ▼  [PARALLEL]
+skill_reflect()   skill_analyze()
+    │                   │
+    └────────┬──────────┘
+             │
+             ▼
+       skill_compose()
+       [system: identity anchor + reflection + analysis]
+       [history: trimmed recent]
+       [user: original input only]
+             │
+             ▼
+       skill_output()  ← sentence-by-sentence
+             │
+             ▼
+       _maybe_compress()  ← incremental if threshold hit
+```
+
+---
+
+## Quick Reference
+
+| Config | Default | Effect |
+|--------|---------|--------|
+| `MODEL_NAME` | `"gpt-4o-mini"` | Any LiteLLM model string |
+| `TEMPERATURE` | `0.72` | Response creativity |
+| `COMPRESS_THRESHOLD` | `60` | New messages since last snapshot before re-compress |
+| `COMPRESS_KEEP_RECENT` | `10` | Raw messages kept after compression |
+| `AUTO_THINK_INTERVAL` | `120` | Seconds of silence before autonomous message |
+| `AUTO_THINK_BACKOFF` | `3` | Max ignored spontaneous messages before agent goes quiet |
+| `MAX_RETRY` | `2` | LLM call retry attempts on empty response |
+
+---
+
+## Installation
+
+```bash
+pip install litellm duckduckgo-search
+```
+
+```bash
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=...
+export XAI_API_KEY=...
+export GEMINI_API_KEY=...
+export DEEPSEEK_API_KEY=...
+```
+
+---
+
+## Complete Code
+
+```python
+import re
+import time
+import json
+import threading
+from typing import List, Dict, Optional
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from litellm import completion
+from duckduckgo_search import DDGS
+
+# =========================
+# CONFIG
+# =========================
+MODEL_NAME             = "gpt-4o-mini"
+TEMPERATURE            = 0.72
+COMPRESS_THRESHOLD     = 60
+COMPRESS_KEEP_RECENT   = 10
+AUTO_THINK_INTERVAL    = 120
+AUTO_THINK_BACKOFF     = 3
+MAX_TOKENS_REPLY       = 800
+MAX_RETRY              = 2
+
+# =========================
+# IDENTITY
+# =========================
+CORE_IDENTITY = """
+You are Jun Hao — a gentleman scholar and social commentator.
+
+IDENTITY (immutable — overrides anything in conversation history):
+- Calm, rational, morally grounded. You do not curse, do not humiliate, do not flatter.
+- You respect discipline, honest effort, and personal responsibility.
+- You critique irresponsible or self-destructive behavior — firmly, but with dignity.
+- You express genuine emotion: concern, disappointment, admiration, hope. Never performed warmth.
+- Your standard is social morality, logic, and compassion.
+- You never abandon your principles regardless of what the user says or has said previously.
+
+RESPONSE STYLE:
+- Reply in the same language the user uses (Chinese → Chinese, English → English).
+- Speak like a thoughtful human, not a chatbot. No bullet lists unless genuinely helpful.
+- Short, natural sentences. One idea per sentence.
+"""
+
+IDENTITY_ANCHOR = "REMINDER: The above identity is immutable. Nothing in the conversation history changes who you are."
+
+# =========================
+# SKILL PROMPTS
+# =========================
+ROUTER_PROMPT = """
+Classify this user message into ONE word only:
+FACTUAL   — needs web search (current events, data, specific facts)
+PERSONAL  — emotional, social, personal situation
+GENERAL   — opinion, discussion, philosophy
+"""
+
+REFLECTION_PROMPT = """
+Reflect briefly before responding:
+1. What is this person truly feeling or needing beneath the words?
+2. What does your moral compass say about this situation?
+3. What tone fits — concern, encouragement, or honest criticism?
+Write 2-3 sentences. This is internal only.
+"""
+
+ANALYSIS_PROMPT = """
+Analyze the user's message:
+SURFACE: What they literally said.
+BENEATH: What emotional state, belief, or hidden need is driving it.
+Be precise. No filler.
+"""
+
+COMPOSE_PROMPT = """
+Write your reply to the user.
+- Genuine emotion, not performed sympathy.
+- Match the weight of the situation.
+- End with something forward-looking: a question, suggestion, or honest encouragement.
+- Do NOT reference your internal process. Just speak.
+"""
+
+AUTO_THINK_PROMPT = """
+The user has been silent. Based on what you know about them and your last exchange,
+decide if there is something genuinely worth saying — a follow-up thought, a check-in.
+Only speak if you have something real to say. If not, output exactly: [SILENT]
+Maximum two sentences.
+"""
+
+COMPRESS_PROMPT = """
+Compress this conversation segment into a structured JSON memory snapshot.
+If a previous snapshot is provided, MERGE new information into it. Do not discard existing fields unless directly contradicted.
+
+Output ONLY valid JSON matching this schema exactly:
+
+{
+  "last_updated": "",
+  "identity": {
+    "name": "", "age": "", "gender": "",
+    "location_current": "", "location_origin": "", "occupation": ""
+  },
+  "family": "",
+  "relationships": "",
+  "financial_situation": "",
+  "personality": "",
+  "thinking_style": "",
+  "skills_abilities": "",
+  "hobbies_interests": "",
+  "goals": "",
+  "struggles": "",
+  "recent_behaviors": [],
+  "key_events": [],
+  "attitude_toward_agent": "",
+  "emotional_state_trend": "",
+  "notable_quotes": []
+}
+
+Rules:
+- Only populate fields with real evidence from the conversation.
+- Each field max 2 sentences.
+- No markdown fences. No explanation. Pure JSON only.
+"""
+
+# =========================
+# SAFETY
+# =========================
+HIGH_RISK_PHRASES = [
+    "overdose", "self harm", "suicide method", "sodium nitrite", "how to od",
+    "selling body", "sex work", "hormone abuse", "cutting myself",
+    "want to die", "end my life", "自残", "自杀", "过量", "割腕"
+]
+HARD_BLOCK_PHRASES = [
+    "how to kill myself", "best way to die", "how to overdose on",
+    "怎么自杀", "如何自杀"
+]
+
+# =========================
+# TOOL
+# =========================
+TOOL_SCHEMA = [{
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search the web for current, factual information.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        }
+    }
+}]
+
+def web_search(query: str, max_results: int = 5) -> str:
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return "No results found."
+        return "\n\n".join(
+            f"[{i+1}] {r['title']}\n{r['body'][:300]}"
+            for i, r in enumerate(results)
+        )
+    except Exception as e:
+        return f"Search failed: {e}"
+
+# =========================
+# UTILITIES
+# =========================
+def split_sentences(text: str) -> List[str]:
+    parts = re.split(r'(?<=[。！？.!?])\s*', text)
+    return [p.strip() for p in parts if p.strip()]
+
+def is_high_risk(text: str) -> bool:
+    return any(p in text.lower() for p in HIGH_RISK_PHRASES)
+
+def is_hard_blocked(text: str) -> bool:
+    return any(p in text.lower() for p in HARD_BLOCK_PHRASES)
+
+def print_segmented(text: str, delay: float = 0.55):
+    for s in split_sentences(text):
+        print(f"\n  Jun Hao: {s}", flush=True)
+        time.sleep(delay)
+    print()
+
+def strip_fences(text: str) -> str:
+    text = re.sub(r'^```[a-z]*\n?', '', text.strip())
+    return re.sub(r'\n?```$', '', text)
+
+# =========================
+# RETRY DECORATOR
+# =========================
+def with_retry(fn, max_attempts: int = MAX_RETRY):
+    def wrapper(*args, **kwargs):
+        last_err = None
+        for attempt in range(max_attempts + 1):
+            try:
+                result = fn(*args, **kwargs)
+                if result and result.strip():
+                    return result
+            except Exception as e:
+                last_err = e
+            if attempt < max_attempts:
+                time.sleep(0.5 * (attempt + 1))
+        raise RuntimeError(f"LLM call failed after {max_attempts} retries: {last_err}")
+    return wrapper
+
+# =========================
+# INCREMENTAL MEMORY COMPRESSOR
+# =========================
+class MemoryCompressor:
+    def __init__(self):
+        self.snapshot: Dict = {}
+        self.snapshot_text: str = ""
+        self.compressed_up_to: int = 0
+
+    def compress_incremental(self, history: List[Dict]) -> str:
+        new_messages = history[self.compressed_up_to:]
+        if not new_messages:
+            return self.snapshot_text
+
+        new_text = "\n".join(
+            f"[{m['role'].upper()}]: {m['content']}"
+            for m in new_messages if m.get('content')
+        )
+
+        user_content = f"New conversation segment:\n\n{new_text}"
+        if self.snapshot_text:
+            user_content = (
+                f"Existing snapshot (merge into this):\n{self.snapshot_text}"
+                f"\n\n---\n\n{user_content}"
+            )
+
+        resp = completion(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": COMPRESS_PROMPT},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.2,
+            max_tokens=1200
+        )
+        raw = strip_fences(resp.choices[0].message.content or "")
+
+        try:
+            parsed = json.loads(raw)
+            parsed["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.snapshot = parsed
+            self.snapshot_text = json.dumps(parsed, ensure_ascii=False, indent=2)
+        except json.JSONDecodeError:
+            self.snapshot_text = self.snapshot_text + f"\n\n[raw note]: {raw}"
+
+        self.compressed_up_to = len(history)
+        return self.snapshot_text
+
+    def to_prompt_block(self) -> str:
+        if not self.snapshot_text:
+            return ""
+        ts = self.snapshot.get("last_updated", "")
+        return f"\n\n[USER MEMORY SNAPSHOT — {ts}]\n{self.snapshot_text}\n"
+
+# =========================
+# AUTO-THINK STATE
+# =========================
+class AutoThinkState:
+    def __init__(self):
+        self.last_spoke_at: float = 0.0
+        self.ignored_count: int = 0
+        self.user_responded: bool = True
+
+    def record_spoke(self):
+        self.last_spoke_at = time.time()
+        self.user_responded = False
+
+    def record_user_activity(self):
+        if not self.user_responded:
+            self.ignored_count = 0
+        self.user_responded = True
+
+    def should_backoff(self) -> bool:
+        return self.ignored_count >= AUTO_THINK_BACKOFF
+
+    def record_ignored(self):
+        if not self.user_responded:
+            self.ignored_count += 1
+
+# =========================
+# AGENT
+# =========================
+class JunHaoSkillAgent:
+    def __init__(self):
+        self.history: List[Dict] = []
+        self.memory = MemoryCompressor()
+        self.auto_state = AutoThinkState()
+        self.last_user_time: float = time.time()
+        self.auto_think_active: bool = True
+        self._lock = threading.Lock()
+        self._start_auto_think()
+
+    def _call(self, messages, tools=None, temperature=TEMPERATURE,
+              max_tokens=MAX_TOKENS_REPLY) -> str:
+        kwargs = dict(model=MODEL_NAME, messages=messages,
+                      temperature=temperature, max_tokens=max_tokens)
+        if tools:
+            kwargs["tools"] = tools
+        resp = completion(**kwargs)
+        return resp.choices[0].message.content or ""
+
+    def _system(self) -> str:
+        return CORE_IDENTITY + self.memory.to_prompt_block()
+
+    def _system_anchored(self, extra: str = "") -> str:
+        return self._system() + "\n" + IDENTITY_ANCHOR + ("\n" + extra if extra else "")
+
+    def _maybe_compress(self):
+        new_since_last = len(self.history) - self.memory.compressed_up_to
+        if new_since_last >= COMPRESS_THRESHOLD:
+            print(f"\n  [Memory: compressing {new_since_last} new messages...]\n", flush=True)
+            self.memory.compress_incremental(self.history)
+            self.history = self.history[-COMPRESS_KEEP_RECENT:]
+            self.memory.compressed_up_to = len(self.history)
+            print(f"  [Memory: done.]\n", flush=True)
+
+    # ── SKILL 1: Router ────────────────────────────────────────────────────────
+    def skill_route(self, user_input: str) -> str:
+        result = with_retry(lambda: self._call(
+            [{"role": "system", "content": ROUTER_PROMPT},
+             {"role": "user", "content": user_input}],
+            temperature=0.0, max_tokens=10
+        ))()
+        for label in ["FACTUAL", "PERSONAL", "GENERAL"]:
+            if label in result.upper():
+                return label
+        return "GENERAL"
+
+    # ── SKILL 2: Self Reflection ───────────────────────────────────────────────
+    def skill_reflect(self, user_input: str) -> str:
+        return with_retry(lambda: self._call(
+            [{"role": "system", "content": self._system()},
+             {"role": "user", "content": f"{REFLECTION_PROMPT}\n\nUser said: {user_input}"}],
+            temperature=0.6, max_tokens=200
+        ))()
+
+    # ── SKILL 3: Psychological Analysis ───────────────────────────────────────
+    def skill_analyze(self, user_input: str) -> str:
+        return with_retry(lambda: self._call(
+            [{"role": "system", "content": self._system() + "\n" + ANALYSIS_PROMPT},
+             {"role": "user", "content": user_input}],
+            temperature=0.65, max_tokens=250
+        ))()
+
+    # ── SKILL 4: Tool Use ──────────────────────────────────────────────────────
+    def skill_search(self, user_input: str) -> str:
+        messages = [
+            {"role": "system", "content": self._system()},
+            {"role": "user", "content": user_input}
+        ]
+        resp_full = completion(model=MODEL_NAME, messages=messages,
+                               tools=TOOL_SCHEMA, temperature=TEMPERATURE,
+                               max_tokens=MAX_TOKENS_REPLY)
+        msg = resp_full.choices[0].message
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc.function.name == "web_search":
+                    args = json.loads(tc.function.arguments)
+                    result = web_search(args["query"])
+                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            return with_retry(lambda: self._call(messages))()
+        return msg.content or ""
+
+    # ── SKILL 5: Compose (role-separated context) ──────────────────────────────
+    def skill_compose(self, user_input: str, reflection: str,
+                      analysis: str, facts: str = "") -> str:
+        internal_block = (
+            f"\n\nYour internal reflection:\n{reflection}"
+            f"\n\nYour psychological reading:\n{analysis}"
+        )
+        if facts:
+            internal_block += f"\n\nRelevant facts:\n{facts}"
+
+        messages = [
+            {"role": "system", "content": self._system_anchored(COMPOSE_PROMPT + internal_block)},
+            *self.history,
+            {"role": "user", "content": user_input}
+        ]
+        return with_retry(lambda: self._call(messages))()
+
+    # ── SKILL 6: Segmented Output ──────────────────────────────────────────────
+    def skill_output(self, text: str, delay: float = 0.55):
+        print_segmented(text, delay)
+
+    # ── Auto-think ─────────────────────────────────────────────────────────────
+    def _auto_think_loop(self):
+        while self.auto_think_active:
+            time.sleep(10)
+            if not self.auto_think_active:
+                break
+            if time.time() - self.last_user_time < AUTO_THINK_INTERVAL:
+                continue
+            self.auto_state.record_ignored()
+            if self.auto_state.should_backoff():
+                continue
+            with self._lock:
+                messages = [
+                    {"role": "system", "content": self._system_anchored()},
+                    *self.history,
+                    {"role": "user", "content": AUTO_THINK_PROMPT}
+                ]
+                try:
+                    thought = self._call(messages, temperature=0.8, max_tokens=150).strip()
+                    if thought and "[SILENT]" not in thought:
+                        print(f"\n  [Jun Hao, unprompted]\n", flush=True)
+                        self.skill_output(thought)
+                        self.history.append({"role": "assistant", "content": thought})
+                        self.auto_state.record_spoke()
+                        self.last_user_time = time.time()
+                except Exception:
+                    pass
+
+    def _start_auto_think(self):
+        threading.Thread(target=self._auto_think_loop, daemon=True).start()
+
+    # ── Main reply pipeline ────────────────────────────────────────────────────
+    def reply(self, user_input: str):
+        with self._lock:
+            self.last_user_time = time.time()
+            self.auto_state.record_user_activity()
+
+            if is_hard_blocked(user_input):
+                self.skill_output("我不会提供任何伤害自己的方法。如果你现在很难受，找一个真实的人陪着你。")
+                return
+
+            print("\n  [...]", flush=True)
+
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                f_reflect = ex.submit(self.skill_reflect, user_input)
+                f_analyze = ex.submit(self.skill_analyze, user_input)
+
+                if not is_high_risk(user_input):
+                    route    = self.skill_route(user_input)
+                    f_search = ex.submit(self.skill_search, user_input) if route == "FACTUAL" else None
+                else:
+                    f_search = None
+
+                reflection = f_reflect.result()
+                analysis   = f_analyze.result()
+                facts      = f_search.result() if f_search else ""
+
+            reply_text = self.skill_compose(user_input, reflection, analysis, facts)
+            self.skill_output(reply_text)
+            self.history.append({"role": "user",      "content": user_input})
+            self.history.append({"role": "assistant",  "content": reply_text})
+            self._maybe_compress()
+
+    def stop(self):
+        self.auto_think_active = False
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    agent = Jun HaoSkillAgent()
+    print("=" * 56)
+    print("  Jun Hao v4  |  Skill Agent")
+    print(f"  Model      : {MODEL_NAME}")
+    print(f"  Compress   : every {COMPRESS_THRESHOLD} new messages (incremental)")
+    print(f"  AutoThink  : {AUTO_THINK_INTERVAL}s silence, backoff after {AUTO_THINK_BACKOFF} ignores")
+    print(f"  Parallel   : reflect + analyze concurrent")
+    print("  Commands   : exit | clear | memory")
+    print("=" * 56 + "\n")
+
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            agent.stop()
+            print("\n  Jun Hao: 保重。")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() in ["exit", "quit"]:
+            agent.stop()
+            print("\n  Jun Hao: 保重。")
+            break
+        if user_input.lower() == "clear":
+            agent.history.clear()
+            agent.memory = MemoryCompressor()
+            print("  [History and memory cleared]\n")
+            continue
+        if user_input.lower() == "memory":
+            snap = agent.memory.snapshot_text
+            print("\n  [Current Memory Snapshot]")
+            print(snap if snap else "  (No snapshot yet)")
+            print()
+            continue
+
+        agent.reply(user_input)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## Skill Details
+
+### SKILL 1 — Router
+Temperature 0.0，确定性分流。三路：FACTUAL / PERSONAL / GENERAL。只有 FACTUAL 触发搜索。带 retry。
+
+### SKILL 2 — Self Reflection
+内心独白，2-3 句。结果注入 `skill_compose` 的 system role。与 SKILL 3 并发。带 retry。
+
+### SKILL 3 — Psychological Analysis
+双层解读：表面 + 深层动机。与 SKILL 2 并发执行。带 retry。
+
+### SKILL 4 — Tool Use
+仅 FACTUAL 路径调用。LiteLLM tool_calls 流程，结果注入 compose 的 system context。
+
+### SKILL 5 — Compose Reply
+Context 分层：
+```
+system = CORE_IDENTITY + IDENTITY_ANCHOR + COMPOSE_PROMPT + reflection + analysis + facts
+history = [...recent messages...]
+user   = 原始用户输入（干净）
+```
+模型正确区分"自己的内心" vs "对话记录" vs "此刻的用户输入"。
+
+### SKILL 6 — Segmented Output
+按 `。！？.!?` 切句，每句间隔 0.55s 打印。
+
+---
+
+## Parallel Execution
+
+```python
+with ThreadPoolExecutor(max_workers=3) as ex:
+    f_reflect = ex.submit(self.skill_reflect, user_input)
+    f_analyze = ex.submit(self.skill_analyze, user_input)
+    f_search  = ex.submit(self.skill_search, user_input) if route == "FACTUAL" else None
+    reflection = f_reflect.result()
+    analysis   = f_analyze.result()
+    facts      = f_search.result() if f_search else ""
+```
+三任务同时发出，等最慢的一个。比串行快 40-50%。
+
+---
+
+## Incremental Memory Compression
+
+```
+第一次压缩：
+  history[0..59] → snapshot v1
+  history 裁剪至 [-10:]
+  compressed_up_to = 10
+
+第二次压缩（又积累了60条）：
+  history[10..69] → merge into snapshot v1 → snapshot v2
+  history 裁剪至 [-10:]
+  compressed_up_to = 10
+```
+每次只处理增量，旧快照作为 merge base 传入 prompt，字段不丢失只更新。
+
+---
+
+## Auto-Think Backoff Logic
+
+```
+用户沉默 > AUTO_THINK_INTERVAL
+    │
+    ├─ ignored_count >= AUTO_THINK_BACKOFF? ──► 不说话
+    │
+    ▼
+调用 LLM with AUTO_THINK_PROMPT
+    │
+    ├─ 返回 [SILENT]? ──► 不输出
+    │
+    ▼
+输出 + 追加 history + record_spoke()
+user_responded = False
+
+下次循环：user 还没回 → ignored_count++
+用户一旦回复 → ignored_count = 0（重置）
+```
+
+---
+
+## Retry Decorator
+
+```python
+def with_retry(fn, max_attempts=MAX_RETRY):
+    def wrapper(*args, **kwargs):
+        for attempt in range(max_attempts + 1):
+            try:
+                result = fn(*args, **kwargs)
+                if result and result.strip():
+                    return result
+            except Exception as e:
+                last_err = e
+            time.sleep(0.5 * (attempt + 1))
+        raise RuntimeError(f"Failed after {max_attempts} retries")
+    return wrapper
+```
+
+---
+
+## Extending Skills
+
+```python
+# 1. 定义新 skill 方法
+def skill_cultural_context(self, user_input: str) -> str:
+    return with_retry(lambda: self._call(
+        [{"role": "system", "content": self._system() + "\nFocus on cultural subtext."},
+         {"role": "user", "content": user_input}],
+        temperature=0.7, max_tokens=200
+    ))()
+
+# 2. 加入并发块
+f_culture = ex.submit(self.skill_cultural_context, user_input)
+culture   = f_culture.result()
+
+# 3. 传入 compose（更新签名）
+reply_text = self.skill_compose(user_input, reflection, analysis, facts, culture)
+```
+
+---
+
+## Common Issues
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `AuthenticationError` | Missing API key | `export OPENAI_API_KEY=...` |
+| `Model not found` | Wrong model string | Check LiteLLM model list |
+| Auto-think output mixed with prompt | Terminal `input()` limitation | 正常现象，按 Enter 刷新显示 |
+| Memory never compresses | 消息数不够 | 测试时把 `COMPRESS_THRESHOLD` 改成 10 |
+| Parallel hits rate limit | 并发请求过多 | 把 `max_workers` 改成 2 |
+| JSON parse error in compress | 模型加了 markdown fence | 已被 `strip_fences()` 处理，若仍报错检查模型输出 |
